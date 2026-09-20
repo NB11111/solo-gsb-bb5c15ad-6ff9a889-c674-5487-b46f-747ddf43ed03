@@ -62,6 +62,7 @@ docker compose up --build
 | `gripper_zone` | object | 可选，缺省无保留区 | 机台叼口保留区：该边整条区域不得放置成品 |
 | `gripper_zone.edge` | string | `top` / `right` / `bottom` / `left` | 叼口所在原纸边 |
 | `gripper_zone.size` | number | `> 0` | 保留区宽度（垂直于该边的尺寸） |
+| `duplex_flip` | string | 可选，`left_right` / `top_bottom` | 双面印刷翻页方式；提供后每张原纸额外返回背面定位 `back_placements` 与 `back_cut_tree`，缺省时响应结构不变 |
 
 **锁定数量计入需求**：每种成品的锁定件数从其 `quantity` 中扣除，超出 `quantity` 返回 422；锁定项之间不得重叠。锁定布局还必须在给定 `kerf` 下能递归分解为铡刀切割树（每件之间留得出贯穿全矩形的切缝），否则返回 422 并在 `detail` 中指出冲突项的序号（从 1 开始）与 `item` id。验证通过后，引擎只在切割树的**可用余料叶**中放置剩余数量，放不下再开新原纸；锁定成品的坐标永不移动。
 
@@ -98,6 +99,21 @@ docker compose up --build
 }
 ```
 
+**双面印刷背面定位（`duplex_flip`）**：面向双面印刷，提供 `duplex_flip` 后，每张原纸（`sheets[]`）在正面结果之外额外返回背面定位 `back_placements` 与背面切割树 `back_cut_tree`。翻页方式：
+
+- `left_right`（左右翻页）：沿原纸竖直轴镜像，任意矩形 `x′ = 纸宽 − (x + width)`，`y` 不变；
+- `top_bottom`（上下翻页）：沿原纸水平轴镜像，任意矩形 `y′ = 纸高 − (y + height)`，`x` 不变。
+
+背面定位的规则：
+
+- 每件成品的**净尺寸矩形与 `production_rect` 分别独立镜像**——不把正面的出血偏移重新套用到镜像后的净成品位置；因此四边出血不对称时，背面净成品在生产矩形内的偏移正是几何镜像的结果；
+- 条目的 `item`、`rotated`、`locked` 与正面逐条对应且保持不变（宽度/高度也不变）；
+- `back_cut_tree` 递归镜像全部节点（含 `cut` / `item` / `waste`，叼口 `waste` 叶同样镜像）：每个节点的外接矩形按翻转轴镜像，且**镜像轴对应方向的 `cut` 节点反转其 `children`**——`left_right` 时反转竖直刀的左右子节点，`top_bottom` 时反转水平刀的上下子节点；垂直于镜像轴的 `cut` 方向不反转子节点。反转后背面子节点仍按坐标升序（左侧/上侧为 `children[0]`），背面树依然是切缝恰好为 `kerf` 的合法铡刀切割树；
+- 背面 `item` 叶与 `back_placements` 条目的 `production_rect` 一一对应；
+- 未提供 `duplex_flip`（或显式为 `null`）时，响应不包含 `back_placements` / `back_cut_tree`，结构与之前完全一致。
+
+最小示例：100×100 原纸、成品 40×30 排在正面 `(0, 0)`，则 `duplex_flip: "left_right"` 时背面净尺寸矩形为 `(60, 0, 40, 30)`；若成品带 `bleed: {"top": 1, "right": 2, "bottom": 3, "left": 4}`，正面 `production_rect` 为 `(0, 0, 46, 34)`、净尺寸在 `(4, 1)`，背面 `production_rect` 为 `(54, 0, 46, 34)`，净尺寸矩形独立镜像后为 `(56, 1, 40, 30)`——不会从背面生产矩形重新减去正面出血偏移。
+
 **响应（200）**
 
 ```json
@@ -123,7 +139,15 @@ docker compose up --build
         "direction": "vertical",
         "x": 0.0, "y": 0.0, "width": 900.0, "height": 600.0,
         "children": [ { "…": "…" }, { "…": "…" } ]
-      }
+      },
+      "back_placements": [
+        {
+          "item": "flyer", "x": 687.0, "y": 3.0, "width": 210.0, "height": 148.0,
+          "rotated": false, "locked": true,
+          "production_rect": { "x": 684.0, "y": 0.0, "width": 216.0, "height": 154.0 }
+        }
+      ],
+      "back_cut_tree": { "…": "cut_tree 的左右镜像（vertical cut 反转 children）…" }
     }
   ],
   "summary": {
@@ -139,6 +163,7 @@ docker compose up --build
 - `placements[]`：每件成品的**净尺寸**左上角坐标、放置后的净宽高与 `rotated`（是否旋转 90°；旋转后 `width`/`height` 为原高/宽），以及 `locked`（`true` 表示该件来自请求中的 `locked_placements`，坐标与请求完全一致；锁定件全部位于 `index: 0` 的第一张原纸）。`production_rect` 为净尺寸加四边出血后的生产矩形（旋转时出血随成品同步旋转），与 `cut_tree` 中对应 `item` 叶的范围一致；未设置出血时与净尺寸相同。坐标系原点在**原纸左上角**，x 向右、y 向下。
 - `cut_count`：该张原纸切割树中的 `cut` 节点（刀）数，与 `cut_tree` 实际一致；设置 `max_cuts_per_sheet` 时保证不超过上限。
 - `cut_tree`：同时覆盖锁定件与新增件，`item` 叶即对应成品的生产矩形（锁定件的 `item` 叶为由请求坐标反推出的生产矩形）；树中其余的 `waste` 叶即剩余数量可使用的余料。
+- `back_placements` / `back_cut_tree`：**仅在请求提供 `duplex_flip` 时出现**。`back_placements[]` 与正面 `placements[]` 逐条对应，净尺寸矩形与 `production_rect` 已分别按翻转轴镜像，`item`、`rotated`、`locked` 不变；`back_cut_tree` 是 `cut_tree` 的递归镜像，镜像轴对应方向的刀反转子节点，背面 `item` 叶与 `back_placements[].production_rect` 一一对应。未提供 `duplex_flip` 时这两个字段不出现。
 - `utilization`：成品**净面积** ÷ 原纸面积，出血、切缝与边角废料均计入损耗（分子包含锁定件与新增件）。
 - `summary`：总用纸数、总件数（锁定件 + 剩余件，即全部 `items` 数量之和）与整体利用率。
 
@@ -157,6 +182,8 @@ docker compose up --build
 
 **示例**：竖切节点中 `children[1].x === children[0].x + children[0].width + kerf`。
 
+提供 `duplex_flip` 时的 `back_cut_tree` 遵守同样的结构约束（合法二叉铡刀树、切缝恰好为 `kerf`、`children[0]` 为左/上侧）：它是正面树的递归镜像，节点数量与类型不变，只是坐标翻到背面；沿镜像轴的刀（`left_right` 时为 `vertical` 刀、`top_bottom` 时为 `horizontal` 刀）交换两个子节点，保证翻页后 `children[0]` 仍是坐标较小的一侧。
+
 ### 错误
 
 | 状态码 | 情形 |
@@ -173,6 +200,7 @@ docker compose up --build
 | `422` | 成品能放进原纸、但放不进叼口保留区之外的剩余区域：<br>`item 'poster' (95.0 x 95.0) does not fit in the 100.0 x 88.0 area left by the gripper_zone (edge 'top', size 10.0, kerf 2.0) on stock 100.0 x 100.0` |
 | `422` | 锁定成品进入叼口保留区或跨过分隔切缝，`detail` 指出序号与 item：<br>`locked placement #2 item 'A' enters the gripper keep-out zone of the gripper_zone (edge 'top', size 10.0, kerf 2.0)`<br>`locked placement #2 item 'A' straddles the separator cut (kerf strip) of the gripper_zone ...` |
 | `422` | 叼口分割刀与排版刀数之和超过 `max_cuts_per_sheet`，例如单件最少需要 3 刀（含分隔刀）却设上限 2：<br>`item 'A' (40.0 x 40.0) needs at least 3 cuts on a fresh sheet 100.0 x 100.0, exceeding max_cuts_per_sheet 2` |
+| `422` | `duplex_flip` 取值不是 `left_right` / `top_bottom`，`detail` 指出该字段 |
 
 ## 本地开发
 
@@ -192,3 +220,4 @@ uvicorn app.main:app --reload
 - 设置 `max_cuts_per_sheet` 后，每张原纸的刀数（`cut` 节点数）不超过该值：第一张原纸先计入锁定树的刀数；选位时跳过切分会超限的余料，适配得分相同时优先新增刀数更少的候选；已开原纸都不可用时新开原纸；单件在空白原纸上所需的最少刀数（两种朝向取小）超限则在排版前直接判定 422。
 - 测试（`tests/check_plan.py`）对每份方案递归校验：每刀贯穿子矩形、切缝恰好等于 `kerf`、成品不重叠、不越界、树叶与坐标列表一致、利用率吻合、`cut_count` 与切割树的 `cut` 节点数一致、锁定件均在第一张原纸。
 - 设置 `gripper_zone` 时，每张原纸（含锁定件所在的第一张）的树根先以一道贯穿全纸的分割刀分出叼口 `waste` 叶（该刀计入 `cut_count` 与 `max_cuts_per_sheet`、消耗一个 `kerf`），随后全部排版只在剩余内缩区域内进行；锁定件进入保留区或压在分隔切缝上即在排版前以 422 拒绝。
+- 设置 `duplex_flip` 时，背面定位是正面结果的纯几何镜像（`left_right`：`x′ = 纸宽 − (x + width)`；`top_bottom`：`y′ = 纸高 − (y + height)`），不重新排版、不重新计算出血偏移：净尺寸矩形与生产矩形各自镜像，`item`/`rotated`/`locked` 保持不变；`back_cut_tree` 递归镜像全部节点并在镜像轴对应方向的 `cut` 节点反转子节点，使背面子节点仍按坐标升序，背面 `item` 叶与背面 `production_rect` 一一对应。

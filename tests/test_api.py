@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from tests.check_plan import check_plan
+from tests.check_plan import check_duplex_plan, check_plan
 
 client = TestClient(app)
 
@@ -689,3 +689,196 @@ def test_locked_bleed_entering_gripper_rejected():
     response = client.post("/plans", json=payload)
     assert response.status_code == 422
     assert "#1" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# duplex_flip (双面印刷背面定位)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flip", ["left_right", "top_bottom"])
+def test_duplex_flip_returns_back_side(flip):
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 2,
+        "items": [{"id": "A", "width": 40, "height": 30, "quantity": 8}],
+        "duplex_flip": flip,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    check_duplex_plan(body, flip)
+    assert len(body["sheets"]) >= 2
+    for sheet in body["sheets"]:
+        assert len(sheet["back_placements"]) == len(sheet["placements"])
+        for p, bp in zip(sheet["placements"], sheet["back_placements"]):
+            assert bp["item"] == p["item"]
+            assert bp["rotated"] == p["rotated"]
+            assert bp["locked"] == p["locked"]
+
+
+def test_duplex_left_right_mirror_coordinates():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "duplex_flip": "left_right",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "left_right")
+    front = body["sheets"][0]["placements"][0]
+    back = body["sheets"][0]["back_placements"][0]
+    assert (front["x"], front["y"]) == (0.0, 0.0)
+    # x' = 100 - (0 + 40); y unchanged.
+    assert (back["x"], back["y"], back["width"], back["height"]) == (
+        60.0, 0.0, 40.0, 40.0)
+    assert back["production_rect"] == {
+        "x": 60.0, "y": 0.0, "width": 40.0, "height": 40.0}
+
+
+def test_duplex_top_bottom_mirror_coordinates():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 40, "height": 30, "quantity": 1}],
+        "duplex_flip": "top_bottom",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "top_bottom")
+    back = body["sheets"][0]["back_placements"][0]
+    # y' = 100 - (0 + 30); x unchanged.
+    assert (back["x"], back["y"], back["width"], back["height"]) == (
+        0.0, 70.0, 40.0, 30.0)
+
+
+@pytest.mark.parametrize("flip", ["left_right", "top_bottom"])
+def test_duplex_asymmetric_bleed_mirrored_not_reattributed(flip):
+    # Bleed 1/2/3/4 is strongly asymmetric.  The front net piece sits at
+    # (4, 1) inside a 46x34 production rect at the origin.  On the back
+    # side both rectangles are mirrored independently; the mirrored net
+    # piece must NOT be derived by re-applying the front bleed offsets to
+    # the mirrored production rectangle.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 40, "height": 30, "quantity": 1,
+                   "bleed": {"top": 1, "right": 2, "bottom": 3, "left": 4}}],
+        "duplex_flip": flip,
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, flip)
+    front = body["sheets"][0]["placements"][0]
+    back = body["sheets"][0]["back_placements"][0]
+    fpr, bpr = front["production_rect"], back["production_rect"]
+    if flip == "left_right":
+        assert fpr == {"x": 0.0, "y": 0.0, "width": 46.0, "height": 34.0}
+        assert (bpr["x"], bpr["y"]) == (54.0, 0.0)
+        # Mirrored net piece: x' = 100 - (4 + 40) = 56.
+        assert (back["x"], back["y"]) == (56.0, 1.0)
+    else:
+        assert (bpr["x"], bpr["y"]) == (0.0, 66.0)
+        # Mirrored net piece: y' = 100 - (1 + 30) = 69.
+        assert (back["x"], back["y"]) == (4.0, 69.0)
+
+
+def test_duplex_back_cut_tree_reverses_axis_children():
+    # Two equal-width pieces side by side: the root is a vertical cut with
+    # the left piece first.  Under left_right the back root must reverse
+    # children so the mirrored (now leftmost) piece stays first.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 50, "height": 100, "quantity": 2}],
+        "duplex_flip": "left_right",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "left_right")
+    root = body["sheets"][0]["cut_tree"]
+    back_root = body["sheets"][0]["back_cut_tree"]
+    assert root["direction"] == "vertical"
+    assert back_root["direction"] == "vertical"
+    first_front, second_front = root["children"]
+    first_back, second_back = back_root["children"]
+    # Ascending x order on the back side: 0 first.
+    assert first_back["x"] == 0.0
+    assert second_back["x"] == 50.0
+    # The back first child mirrors the front second child.
+    assert first_back["x"] == 100 - (second_front["x"]
+                                     + second_front["width"])
+    assert second_back["x"] == 100 - (first_front["x"]
+                                      + first_front["width"])
+
+
+def test_duplex_perpendicular_cuts_keep_child_order():
+    # A vertical root cut is perpendicular to a top_bottom flip, so its
+    # children must NOT be reversed (both keep their x order).
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 50, "height": 100, "quantity": 2}],
+        "duplex_flip": "top_bottom",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "top_bottom")
+    root = body["sheets"][0]["cut_tree"]
+    back_root = body["sheets"][0]["back_cut_tree"]
+    assert [c["x"] for c in back_root["children"]] == [
+        c["x"] for c in root["children"]]
+
+
+def test_duplex_preserves_locked_and_rotated_flags():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 60, "height": 40, "quantity": 1}],
+        "locked_placements": [{"item": "A", "x": 0, "y": 0}],
+        "duplex_flip": "left_right",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "left_right")
+    back = body["sheets"][0]["back_placements"][0]
+    assert back["locked"] is True
+    assert back["rotated"] is False
+    assert (back["x"], back["y"]) == (40.0, 0.0)
+
+    # Rotated piece: flag is carried over unchanged.
+    payload = {
+        "stock": {"width": 50, "height": 100},
+        "items": [{"id": "B", "width": 60, "height": 40, "quantity": 1}],
+        "duplex_flip": "top_bottom",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_duplex_plan(body, "top_bottom")
+    front = body["sheets"][0]["placements"][0]
+    back = body["sheets"][0]["back_placements"][0]
+    assert front["rotated"] is True
+    assert back["rotated"] is True
+
+
+def test_duplex_with_gripper_zone():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 2,
+        "items": [{"id": "A", "width": 30, "height": 30, "quantity": 3}],
+        "gripper_zone": {"edge": "bottom", "size": 10},
+        "duplex_flip": "left_right",
+    }
+    body = client.post("/plans", json=payload).json()
+    check_plan(body)
+    check_duplex_plan(body, "left_right")
+
+
+def test_duplex_field_absent_by_default():
+    before = client.post("/plans", json=VALID_PAYLOAD).json()
+    payload = {**VALID_PAYLOAD, "duplex_flip": None}
+    after = client.post("/plans", json=payload).json()
+    assert before == after
+    for sheet in after["sheets"]:
+        assert "back_placements" not in sheet
+        assert "back_cut_tree" not in sheet
+
+
+def test_duplex_invalid_value_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 10, "height": 10, "quantity": 1}],
+        "duplex_flip": "diagonal",
+    }
+    assert client.post("/plans", json=payload).status_code == 422

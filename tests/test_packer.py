@@ -11,7 +11,13 @@ from app.packer import (
     _best_fit,
     build_plan,
 )
-from tests.check_plan import EPS, check_plan, count_cut_nodes, iter_leaves
+from tests.check_plan import (
+    EPS,
+    check_duplex_plan,
+    check_plan,
+    count_cut_nodes,
+    iter_leaves,
+)
 
 
 def plan(stock_w, stock_h, kerf, items):
@@ -725,3 +731,58 @@ class TestGripperZone:
                        gripper=("left", 10))
         message = str(exc.value)
         assert "#3" in message and "box" in message
+
+
+# ---------------------------------------------------------------------------
+# duplex_flip (双面印刷背面定位)
+# ---------------------------------------------------------------------------
+
+class TestDuplex:
+    @pytest.mark.parametrize("flip", ["left_right", "top_bottom"])
+    def test_back_side_is_a_valid_mirrored_plan(self, flip):
+        result = build_plan(
+            100, 100, 3,
+            [("flyer", 210 // 2 - 5, 60, 6), ("card", 30, 20, 10)],
+            duplex_flip=flip)
+        check_plan(result)
+        check_duplex_plan(result, flip)
+
+    def test_no_flip_keeps_legacy_sheet_shape(self):
+        result = build_plan(100, 100, 0, [("A", 40, 40, 1)])
+        sheet = result["sheets"][0]
+        assert "back_placements" not in sheet
+        assert "back_cut_tree" not in sheet
+
+    def test_net_and_production_rects_mirror_independently(self):
+        # top=1/right=2/bottom=3/left=4: net piece at (4,1) in a 46x34
+        # production rect.  Mirrored independently left/right.
+        result = build_plan(
+            100, 100, 0,
+            [("A", 40, 30, 1, (1, 2, 3, 4))], duplex_flip="left_right")
+        sheet = result["sheets"][0]
+        back = sheet["back_placements"][0]
+        assert back["production_rect"]["x"] == 54.0
+        assert (back["x"], back["y"]) == (56.0, 1.0)
+
+    def test_back_tree_leaves_match_back_placements(self):
+        result = build_plan(100, 100, 3, [("A", 30, 30, 5)],
+                            duplex_flip="top_bottom")
+        check_duplex_plan(result, "top_bottom")
+
+    @pytest.mark.parametrize("flip", ["left_right", "top_bottom"])
+    def test_mirrored_far_edge_trim_sliver_still_guillotine(self, flip):
+        # This layout produces a horizontal cut whose top item child is
+        # 34 wide inside a 36-wide region with kerf 2: the 2-unit far-edge
+        # trim sliver is implicit (no node).  Mirroring moves that sliver
+        # to the opposite/perpendicular edge; the back tree must still be
+        # a kerf-valid guillotine tree with leaves matching back rects.
+        result = build_plan(
+            120, 100, 2,
+            [("A", 40, 30, 9, (1, 2, 3, 4)), ("B", 25, 20, 6)],
+            locked=[("A", 4, 1, False, 1)],
+            gripper=("bottom", 8),
+            max_cuts_per_sheet=40,
+            duplex_flip=flip,
+        )
+        check_plan(result)
+        check_duplex_plan(result, flip)

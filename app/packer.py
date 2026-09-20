@@ -913,6 +913,104 @@ def _node_dict(node: Node) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# duplex printing back-side mirroring (双面印刷)
+# ---------------------------------------------------------------------------
+
+def _mirror_rect_x(rect: dict, sheet_width: float) -> dict:
+    """Mirror a rectangle's x coordinate across the sheet's vertical axis:
+    ``x' = sheet_width - (x + width)`` (used for duplex_flip left_right)."""
+    return {**rect, "x": _num(sheet_width - (rect["x"] + rect["width"]))}
+
+
+def _mirror_rect_y(rect: dict, sheet_height: float) -> dict:
+    """Mirror a rectangle's y coordinate across the sheet's horizontal axis:
+    ``y' = sheet_height - (y + height)`` (used for duplex_flip top_bottom)."""
+    return {**rect, "y": _num(sheet_height - (rect["y"] + rect["height"]))}
+
+
+def _mirror_placements(placements: list[dict], flip: str,
+                       sheet_width: float, sheet_height: float) -> list[dict]:
+    """Build the back-side placements of one sheet for duplex printing.
+
+    The finished (net) rectangle and the production rectangle are mirrored
+    independently across the flip axis.  The item id, ``rotated`` and
+    ``locked`` flags are kept unchanged; asymmetric bleeds therefore stay
+    exactly where the geometric mirroring puts them instead of having the
+    front-side bleed offset re-applied to the mirrored net position.
+    """
+    back = []
+    for p in placements:
+        bp = {
+            "item": p["item"],
+            "width": p["width"],
+            "height": p["height"],
+            "rotated": p["rotated"],
+            "locked": p["locked"],
+        }
+        if flip == "left_right":
+            bp["x"] = _num(sheet_width - (p["x"] + p["width"]))
+            bp["y"] = p["y"]
+            bp["production_rect"] = _mirror_rect_x(p["production_rect"],
+                                                   sheet_width)
+        else:  # top_bottom
+            bp["x"] = p["x"]
+            bp["y"] = _num(sheet_height - (p["y"] + p["height"]))
+            bp["production_rect"] = _mirror_rect_y(p["production_rect"],
+                                                   sheet_height)
+        back.append(bp)
+    return back
+
+
+def _mirror_tree_dict(node: dict, flip: str,
+                      sheet_width: float, sheet_height: float) -> dict:
+    """Recursively mirror every node of a serialized cut tree.
+
+    Every node's rectangle is mirrored across the flip axis.  At a cut
+    whose line separates the two sides exchanged by the flip (a vertical
+    cut for a left/right flip, a horizontal cut for a top/bottom flip) the
+    children are swapped, so the first child keeps the lower coordinate
+    (left/top) and the back-side tree stays in ascending coordinate order.
+    Item leaves keep their item id and ``rotated`` flag.
+    """
+    if node["type"] == "cut":
+        children = [
+            _mirror_tree_dict(child, flip, sheet_width, sheet_height)
+            for child in node["children"]
+        ]
+        # A vertical cut runs parallel to the vertical mirror axis and
+        # splits left from right (the two sides a left/right flip swaps);
+        # a horizontal cut does the same for a top/bottom flip.  Such cuts
+        # reverse their children so the back tree stays in ascending
+        # coordinate order; cuts perpendicular to the axis keep order.
+        if ((flip == "left_right" and node["direction"] == "vertical")
+                or (flip == "top_bottom"
+                    and node["direction"] == "horizontal")):
+            children.reverse()
+        mirrored: dict = {
+            "type": "cut",
+            "direction": node["direction"],
+            "children": children,
+        }
+        rect = {"x": node["x"], "y": node["y"],
+                "width": node["width"], "height": node["height"]}
+    elif node["type"] == "item":
+        mirrored = {"type": "item", "item": node["item"],
+                    "rotated": node["rotated"]}
+        rect = {"x": node["x"], "y": node["y"],
+                "width": node["width"], "height": node["height"]}
+    else:
+        mirrored = {"type": "waste"}
+        rect = {"x": node["x"], "y": node["y"],
+                "width": node["width"], "height": node["height"]}
+
+    if flip == "left_right":
+        mirrored.update(_mirror_rect_x(rect, sheet_width))
+    else:
+        mirrored.update(_mirror_rect_y(rect, sheet_height))
+    return mirrored
+
+
+# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 
@@ -920,7 +1018,8 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
                items: list[tuple[str, float, float, int]],
                locked: list[tuple[str, float, float, bool, int]] | None = None,
                max_cuts_per_sheet: int | None = None,
-               gripper: tuple[str, float] | None = None
+               gripper: tuple[str, float] | None = None,
+               duplex_flip: str | None = None
                ) -> dict:
     """Pack ``items`` onto stock sheets.
 
@@ -938,11 +1037,16 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     in any sheet's tree; the locked layout on the first sheet counts
     towards the cap.  ``gripper`` optionally reserves a full-span strip
     (edge, size) on every sheet: the strip is cut off as permanent waste
-    with one kerf-consuming cut before any packing.  Returns a dict
-    matching the PlanResponse schema.  Raises UnfitItemError if any item
-    cannot fit on a fresh sheet, CutLimitError if the cut cap cannot be
-    honoured, LockedLayoutError if the pinned layout is invalid, or
-    GripperZoneError if the gripper strip cannot be honoured.
+    with one kerf-consuming cut before any packing.  ``duplex_flip`` may be
+    "left_right" or "top_bottom": when set, every result sheet additionally
+    carries ``back_placements`` (each net and production rectangle mirrored
+    independently across the flip axis; item/rotated/locked preserved) and
+    ``back_cut_tree`` (the recursively mirrored tree, with children reversed
+    at cut nodes running along the mirror axis so coordinate order is
+    preserved).  Returns a dict matching the PlanResponse schema.  Raises
+    UnfitItemError if any item cannot fit on a fresh sheet, CutLimitError if
+    the cut cap cannot be honoured, LockedLayoutError if the pinned layout
+    is invalid, or GripperZoneError if the gripper strip cannot be honoured.
     """
     zone: GripperZone | None = None
     if gripper is not None:
@@ -1152,15 +1256,22 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     for index, sheet in enumerate(sheets):
         _finalize(sheet.root)
         total_used += sheet.used_area
-        result_sheets.append({
+        tree_dict = _node_dict(sheet.root)
+        result_sheet = {
             "index": index,
             "width": _num(stock_width),
             "height": _num(stock_height),
             "utilization": round(sheet.used_area / sheet_area, 6),
             "cut_count": _count_cuts(sheet.root),
             "placements": sheet.placements,
-            "cut_tree": _node_dict(sheet.root),
-        })
+            "cut_tree": tree_dict,
+        }
+        if duplex_flip is not None:
+            result_sheet["back_placements"] = _mirror_placements(
+                sheet.placements, duplex_flip, stock_width, stock_height)
+            result_sheet["back_cut_tree"] = _mirror_tree_dict(
+                tree_dict, duplex_flip, stock_width, stock_height)
+        result_sheets.append(result_sheet)
 
     return {
         "stock": {"width": _num(stock_width), "height": _num(stock_height)},
