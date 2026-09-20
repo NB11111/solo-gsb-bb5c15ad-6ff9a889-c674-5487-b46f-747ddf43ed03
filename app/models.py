@@ -101,6 +101,15 @@ class PlanRequest(BaseModel):
             "从原纸切出并记为 waste，其内不得放置任何成品；缺省时无保留区。"
         ),
     )
+    duplex_flip: Optional[Literal["left_right", "top_bottom"]] = Field(
+        default=None,
+        description=(
+            "双面印刷背面定位：left_right 沿竖直轴左右翻面"
+            "（x′ = 纸宽 − (x + width)），top_bottom 沿水平轴上下翻面"
+            "（y′ = 纸高 − (y + height)）。设置后每张纸额外返回"
+            " back_placements 与 back_cut_tree；缺省时响应结构不变。"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_request(self) -> "PlanRequest":
@@ -194,6 +203,23 @@ class SheetPlan(BaseModel):
     cut_count: int = Field(ge=0, description="切割树中的 cut 节点（刀）数")
     placements: list[Placement]
     cut_tree: TreeNode = Field(description="与 placements 坐标一致的二叉切割树")
+    back_placements: Optional[list[Placement]] = Field(
+        default=None,
+        description=(
+            "双面印刷背面定位（请求含 duplex_flip 时返回）：净尺寸矩形与 "
+            "production_rect 分别按对应轴镜像，item、rotated、locked 不变；"
+            "非对称出血不会重新套用正面偏移，背面 production_rect 是正面"
+            "生产矩形的几何镜像"
+        ),
+    )
+    back_cut_tree: Optional[TreeNode] = Field(
+        default=None,
+        description=(
+            "双面印刷背面切割树（请求含 duplex_flip 时返回）：递归镜像全部"
+            "节点，镜像轴方向的 cut 节点反转子节点顺序，使子节点仍按坐标"
+            "升序；item 叶与 back_placements 的 production_rect 一一对应"
+        ),
+    )
 
 
 class Summary(BaseModel):

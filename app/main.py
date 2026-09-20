@@ -37,7 +37,8 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/plans", response_model=PlanResponse)
+@app.post("/plans", response_model=PlanResponse,
+          response_model_exclude_none=True)
 def create_plan(request: PlanRequest) -> dict:
     items = []
     seen_ids = set()
@@ -96,6 +97,7 @@ def create_plan(request: PlanRequest) -> dict:
             locked=locked,
             max_cuts_per_sheet=request.max_cuts_per_sheet,
             gripper=gripper,
+            duplex_flip=request.duplex_flip,
         )
     except (UnfitItemError, LockedLayoutError, CutLimitError,
             GripperZoneError) as exc:
